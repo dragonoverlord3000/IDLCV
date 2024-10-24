@@ -15,7 +15,6 @@ import matplotlib.pyplot as plt
 import random
 # import wandb
 # wandb.login(key="4aaf96e30165bfe476963bc860d96770512c8060")
-from time import time
 import os
 
 if torch.cuda.is_available():
@@ -30,9 +29,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 root_path = "/dtu/datasets1/02516/"
 dataset_folders = ["DRIVE", "PH2_Dataset_images"]
 
-EPOCHS = 20
+EPOCHS = 200
+LEARNING_RATE = 5e-5
 BATCH_SIZE = 4
 NUM_WORKERS = 1
+NUM_LAYERS = 6
 SHUFFLE = True
 
 
@@ -41,7 +42,7 @@ class CustomDataset(Dataset):
         self.image_transform = image_transform
         self.mask_transform = mask_transform
         if data_folder == "DRIVE":
-            self.joint_transform = joint_transform if train else transforms.Compose([transforms.RandomCrop((128,128))])
+            self.joint_transform = joint_transform if train else transforms.Compose([transforms.CenterCrop((128,128))])
         else:
             self.joint_transform = joint_transform if train else transforms.Compose([transforms.Resize((128,128))])
         self.train = train
@@ -133,10 +134,9 @@ def unnormalize(tensor, mean, std):
     
     return tensor
 
-# Example usage with your specific mean and std
+# mean and std for normalization
 mean = [0.485, 0.456, 0.406]
 std = [0.229, 0.224, 0.225]
-
 
 # Plot images and their masks - to show dataset
 def visualizer(dataset, num_samples=4, title="SBS-visualization", folder="./vis"):
@@ -160,6 +160,35 @@ def visualizer(dataset, num_samples=4, title="SBS-visualization", folder="./vis"
     plt.tight_layout()
     plt.savefig(f"{folder}/{title}.png")
     plt.close()
+
+def train_visualizer(dataset, num_samples=4, title="SBS-visualization", folder="./vis"):
+    plt.figure(figsize=(10, 20))
+    for i in range(num_samples):
+        idx = i
+        image, pred, mask = dataset[idx]
+        
+        # Plot the image
+        plt.subplot(num_samples, 3, i*3 + 1)
+        plt.imshow(transforms.ToPILImage()(unnormalize(image, mean, std)))
+        plt.title(f"Image {i+1}")
+        plt.axis("off")
+
+        # Plot the prediction
+        plt.subplot(num_samples, 3, i*3 + 2)
+        plt.imshow(transforms.ToPILImage()(pred), cmap="gray")
+        plt.title(f"Prediction {i+1}")
+        plt.axis("off")
+
+        # Plot the mask
+        plt.subplot(num_samples, 3, i*3 + 3)
+        plt.imshow(transforms.ToPILImage()(mask), cmap="gray")
+        plt.title(f"Mask {i+1}")
+        plt.axis("off")
+        
+    plt.tight_layout()
+    plt.savefig(f"{folder}/{title}.png")
+    plt.close()
+
 
 def get_stats(dataset):
     image, mask = dataset[0]
@@ -244,50 +273,51 @@ class EncoderDecoder(nn.Module):
         pass
 
 
-
 class UNet(nn.Module):
-    def __init__(self):
+    def __init__(self, num_layers=NUM_LAYERS):
         super().__init__()
 
+        # input convolution
+        self.inp = nn.Conv2d(3, 64, 3, padding=1, padding_mode="reflect")
+
         # encoder (downsampling)
-        self.enc_conv0 = nn.Conv2d(3, 64, 3, padding=1)
-        self.pool0 = nn.MaxPool2d(2, 2)  # 128 -> 64
-        self.enc_conv1 = nn.Conv2d(64, 64, 3, padding=1)
-        self.pool1 = nn.MaxPool2d(2, 2)  # 64 -> 32
-        self.enc_conv2 = nn.Conv2d(64, 64, 3, padding=1)
-        self.pool2 = nn.MaxPool2d(2, 2)  # 32 -> 16
-        self.enc_conv3 = nn.Conv2d(64, 64, 3, padding=1)
-        self.pool3 = nn.MaxPool2d(2, 2)  # 16 -> 8
+        self.encoder_blocks = nn.ModuleList([
+            nn.Conv2d(64, 64, 3, padding=1, stride=2, padding_mode="reflect")
+            for i in range(num_layers)
+        ])
 
         # bottleneck
-        self.bottleneck_conv = nn.Conv2d(64, 64, 3, padding=1)
+        self.bottleneck_conv = nn.Conv2d(64, 64, 3, padding=1, padding_mode="reflect")
 
         # decoder (upsampling)
-        self.upsample0 = nn.Upsample(16)  # 8 -> 16
-        self.dec_conv0 = nn.Conv2d(64, 64, 3, padding=1)
-        self.upsample1 = nn.Upsample(32)  # 16 -> 32
-        self.dec_conv1 = nn.Conv2d(64, 64, 3, padding=1)
-        self.upsample2 = nn.Upsample(64)  # 32 -> 64
-        self.dec_conv2 = nn.Conv2d(64, 64, 3, padding=1)
-        self.upsample3 = nn.Upsample(128)  # 64 -> 128
-        self.dec_conv3 = nn.Conv2d(64, 1, 3, padding=1)
+        self.decoder_blocks = nn.ModuleList([
+            nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True), nn.Conv2d(128, 64, 3, padding=1, padding_mode="reflect"))
+            for i in range(num_layers)
+        ])
+
+        # Output convolution
+        self.out = nn.Conv2d(64, 1, 3, padding=1, padding_mode="reflect")
 
     def forward(self, x):
-        # encoder
-        e0 = self.pool0(F.relu(self.enc_conv0(x)))
-        e1 = self.pool1(F.relu(self.enc_conv1(e0)))
-        e2 = self.pool2(F.relu(self.enc_conv2(e1)))
-        e3 = self.pool3(F.relu(self.enc_conv3(e2)))
+        # Input
+        x = self.inp(x)
 
+        # encoder
+        encoder_outs = []
+        for encoder_block in self.encoder_blocks:
+            x = encoder_block(x)
+            encoder_outs.append(x)
+            
         # bottleneck
-        b = F.relu(self.bottleneck_conv(e3))
+        x = F.relu(self.bottleneck_conv(encoder_outs[-1]))
 
         # decoder
-        d0 = F.relu(self.dec_conv0(self.upsample0(b)))
-        d1 = F.relu(self.dec_conv1(self.upsample1(d0)))
-        d2 = F.relu(self.dec_conv2(self.upsample2(d1)))
-        d3 = self.dec_conv3(self.upsample3(d2))
-        return d3
+        for i, decoder_block in enumerate(self.decoder_blocks):
+            x = F.relu(decoder_block(torch.concat([x, encoder_outs[-1-i]], 1)))
+
+        # Output
+        out = self.out(x)
+        return out
 
 # Small sanity check
 tester_model = UNet()
@@ -305,6 +335,7 @@ for image_batch, mask_batch in drive_train_dataloader:
         mask = mask[0]
         num_pixels_drive += len(mask) * len(mask[0])
         num_positive_drive += sum(sum(r) for r in mask)
+
 
 num_pixels_ph2 = 0
 num_positive_ph2 = 0
@@ -343,14 +374,15 @@ def focal_loss(y_pred, y_real):
 weights_drive = torch.tensor(weights_drive, dtype=torch.float32)
 weights_ph2 = torch.tensor(weights_ph2, dtype=torch.float32)
 
-weighted_crossentropy_drive = nn.CrossEntropyLoss(weight=weights_drive, reduction='none')
-weighted_crossentropy_ph2 = nn.CrossEntropyLoss(weight=weights_ph2, reduction='none')
+weighted_drive_bce_loss = torch.nn.BCEWithLogitsLoss(pos_weight=weights_drive[0])
+weighted_ph2_bce_loss = torch.nn.BCEWithLogitsLoss(pos_weight=weights_ph2[0])
 
+def mixed_loss(y_pred, y_real):
+    return F.binary_cross_entropy_with_logits(y_pred, y_real) + F.l1_loss(y_pred, y_real)
 
 # Train loop
-def train(model, opt, loss_fn, epochs, train_loader, test_loader, title="dataset"):
+def train(model, opt, loss_fn, epochs, train_loader, test_loader, title="dataset", plot_folder="./train_plots"):
     for epoch in range(epochs):
-        tic = time()
         print("* Epoch %d/%d" % (epoch+1, epochs))
         avg_loss = 0
         model.train()  # train mode
@@ -366,7 +398,7 @@ def train(model, opt, loss_fn, epochs, train_loader, test_loader, title="dataset
             opt.step()  # update weights
             # calculate metrics to show the user
             avg_loss += loss / len(train_loader)
-        toc = time()
+
         # show intermediate results
         model.eval()  # testing mode
         Y_hat = []
@@ -377,21 +409,22 @@ def train(model, opt, loss_fn, epochs, train_loader, test_loader, title="dataset
             avg_dice += dice_score(pred, mask.squeeze(dim=0).to(torch.int32))
             if i < 4:
                 Y_hat.append(model(image.to(device)).detach().cpu())
-                test_to_plot.append([image.squeeze(dim=0), pred])
+                test_to_plot.append([image.squeeze(dim=0), pred, mask.squeeze(dim=0)])
         avg_dice /= len(test_loader)
         print(f" - loss: {avg_loss}")
         print(f" - Dice score: {avg_dice}")
 
-        visualizer(test_to_plot, num_samples=4, title=f"Dataset-{title}-Epoch-{epoch}", folder="./train_plots")
+        train_visualizer(test_to_plot, num_samples=4, title=f"Dataset-{title}-Epoch-{epoch}", folder=plot_folder)
 
 drive_model = UNet().to(device)
 PH2_model = UNet().to(device)
 
 
-os.makedirs("./train_plots", exist_ok=True)
-print(f"Folder './train_plots' created: {os.path.isdir('./train_plots')}")
-train(drive_model, optim.Adam(drive_model.parameters()), weighted_crossentropy_drive, EPOCHS, drive_train_dataloader, drive_test_dataloader, title="DRIVE")
-train(PH2_model, optim.Adam(PH2_model.parameters()), weighted_crossentropy_ph2, EPOCHS, ph2_train_dataloader, ph2_test_dataloader, title="PH2")
+train_plot_folder = "./train_plots2"
+os.makedirs(train_plot_folder, exist_ok=True)
+print(f"Folder {train_plot_folder} created: {os.path.isdir(train_plot_folder)}")
+train(drive_model, optim.Adam(drive_model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5), weighted_drive_bce_loss, EPOCHS, drive_train_dataloader, drive_test_dataloader, title="DRIVE", plot_folder=train_plot_folder)
+train(PH2_model, optim.Adam(PH2_model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5), weighted_ph2_bce_loss, EPOCHS, ph2_train_dataloader, ph2_test_dataloader, title="PH2", plot_folder=train_plot_folder)
 
 os.makedirs("./models", exist_ok=True)
 print(f"Folder './models' created: {os.path.isdir('./models')}")
