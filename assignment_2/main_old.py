@@ -470,8 +470,8 @@ def train(model, optimizer, train_loader, test_loader, trainset, testset, criter
 
     return out_dict
 
-# Update the sweep configuration
-sweep_config = {
+# Update the sweep configuration for the DRIVE dataset
+sweep_config_drive = {
     'method': 'grid',
     'metric': {'name': 'test_loss', 'goal': 'minimize'},
     'parameters': {
@@ -481,14 +481,36 @@ sweep_config = {
         'base_channels': {'values': [8, 16, 32]},
         'dropout': {'values': [0.0, 0.2, 0.5]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
-        'dataset': {'values': ['DRIVE', 'PH2_Dataset_images']},
+        'dataset': {'value': 'DRIVE'},  # Fixed dataset
         'epochs': {'value': 1000},
         'image_size': {'value': 128}
     }
 }
 
-# Initialize the sweep
-sweep_id = wandb.sweep(sweep_config, project='SegmentationProject')
+# Initialize the sweep for the DRIVE dataset
+sweep_id_drive = wandb.sweep(sweep_config_drive, project='SegmentationProject_DRIVE')
+
+# Update the sweep configuration for the PH2 dataset
+sweep_config_ph2 = {
+    'method': 'grid',
+    'metric': {'name': 'test_loss', 'goal': 'minimize'},
+    'parameters': {
+        'learning_rate': {'values': [1e-4, 1e-3, 1e-2]},
+        'batch_size': {'values': [1, 2, 4]},
+        'num_layers': {'values': [3, 4, 5, 6]},
+        'base_channels': {'values': [8, 16, 32]},
+        'dropout': {'values': [0.0, 0.2, 0.5]},
+        'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
+        'dataset': {'value': 'PH2_Dataset_images'},  # Fixed dataset
+        'epochs': {'value': 1000},
+        'image_size': {'value': 128}
+    }
+}
+
+# Initialize the sweep for the DRIVE dataset
+sweep_id_drive = wandb.sweep(sweep_config_drive, project='SegmentationProject_DRIVE')
+# Initialize the sweep for the PH2 dataset
+sweep_id_ph2 = wandb.sweep(sweep_config_ph2, project='SegmentationProject_PH2')
 
 # Update the run_wandb function
 def run_wandb(config=None):
@@ -522,4 +544,6 @@ def run_wandb(config=None):
         wandb.save(model_path)
 
 # Run the sweep
-wandb.agent(sweep_id, run_wandb)
+wandb.agent(sweep_id_drive, run_wandb)
+wandb.agent(sweep_id_ph2, run_wandb)
+
