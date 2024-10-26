@@ -314,9 +314,10 @@ def compute_metrics(preds, targets):
     precision = TP / (TP + FP + 1e-8)
     recall = TP / (TP + FN + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    dice = f1  # Dice score is equivalent to F1 score in binary classification
+    dice = 2 * TP / (2 * TP + FP + FN + 1e-8)
+    iou = TP / (TP + FP + FN + 1e-8)  # Compute IoU here
 
-    return precision.item(), recall.item(), f1.item(), dice.item()
+    return precision.item(), recall.item(), f1.item(), dice.item(), iou.item()
 
 # Define the save_checkpoint function
 def save_checkpoint(model, optimizer, epoch, out_dict, path='model_checkpoint.pth'):
@@ -387,7 +388,7 @@ def train(model, optimizer, train_loader, test_loader, trainset, testset, criter
         # Compute metrics on training data
         train_preds = torch.cat(train_preds)
         train_targets = torch.cat(train_targets)
-        train_precision, train_recall, train_f1, train_dice = compute_metrics(train_preds, train_targets)
+        train_precision, train_recall, train_f1, train_dice, train_iou = compute_metrics(train_preds, train_targets)
 
         # Testing phase
         test_loss = []
@@ -416,7 +417,7 @@ def train(model, optimizer, train_loader, test_loader, trainset, testset, criter
         # Compute metrics on test data
         test_preds = torch.cat(test_preds)
         test_targets = torch.cat(test_targets)
-        test_precision, test_recall, test_f1, test_dice = compute_metrics(test_preds, test_targets)
+        test_precision, test_recall, test_f1, test_dice, test_iou = compute_metrics(test_preds, test_targets)
 
         # Record statistics
         out_dict['train_acc'].append(train_correct / (len(trainset) * target.numel()))
@@ -431,6 +432,8 @@ def train(model, optimizer, train_loader, test_loader, trainset, testset, criter
         out_dict['test_f1'].append(test_f1)
         out_dict['train_dice'].append(train_dice)
         out_dict['test_dice'].append(test_dice)
+        out_dict['train_iou'].append(train_iou)
+        out_dict['test_iou'].append(test_iou)
 
         # Log to WandB
         wandb.log({
@@ -446,6 +449,8 @@ def train(model, optimizer, train_loader, test_loader, trainset, testset, criter
             "test_f1": out_dict['test_f1'][-1],
             "train_dice": out_dict['train_dice'][-1],
             "test_dice": out_dict['test_dice'][-1],
+            "train_iou": out_dict['train_iou'][-1],
+            "test_iou": out_dict['test_iou'][-1],
             "epoch": epoch,
             "run_id": run_id
         })
@@ -477,7 +482,7 @@ sweep_config = {
         'dropout': {'values': [0.0, 0.2, 0.5]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
         'dataset': {'values': ['DRIVE', 'PH2_Dataset_images']},
-        'epochs': {'value': 400},
+        'epochs': {'value': 1000},
         'image_size': {'value': 128}
     }
 }
