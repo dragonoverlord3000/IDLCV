@@ -13,7 +13,6 @@ import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import wandb
 wandb.login(key='4aaf96e30165bfe476963bc860d96770512c8060')
-import uuid
 import os
 
 if torch.cuda.is_available():
