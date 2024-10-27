@@ -482,7 +482,7 @@ sweep_config_drive = {
         'dropout': {'values': [0.0, 0.2, 0.5]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
         'dataset': {'value': 'DRIVE'},  # Fixed dataset
-        'epochs': {'value': 1000},
+        'epochs': {'value': 400},
         'image_size': {'value': 128}
     }
 }
@@ -502,7 +502,7 @@ sweep_config_ph2 = {
         'dropout': {'values': [0.0, 0.2, 0.5]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
         'dataset': {'value': 'PH2_Dataset_images'},  # Fixed dataset
-        'epochs': {'value': 1000},
+        'epochs': {'value': 400},
         'image_size': {'value': 128}
     }
 }
