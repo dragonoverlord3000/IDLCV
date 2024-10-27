@@ -39,64 +39,90 @@ SHUFFLE = True
 
 # Define the CustomDataset class
 class CustomDataset(Dataset):
-    def __init__(self, train=True, image_transform=None, mask_transform=None, joint_transform=None, data_folder="DRIVE", split_percentage=80):
-        self.image_transform = image_transform
+    def __init__(self, split='train', image_transform=None, mask_transform=None, joint_transform=None, data_folder="DRIVE", split_percentages=(68,16,16), image_size=128):
+        self.image_transform = image_transform if "train" else transforms.Compose([transforms.RandomCrop((image_size,image_size))])
         self.mask_transform = mask_transform
         if data_folder == "DRIVE":
-            self.joint_transform = joint_transform if train else transforms.Compose([transforms.CenterCrop((128,128))])
+            self.joint_transform = joint_transform if split == 'train' else transforms.Compose([transforms.CenterCrop((image_size,image_size))])
         else:
-            self.joint_transform = joint_transform if train else transforms.Compose([transforms.Resize((128,128))])
-        self.train = train
+            self.joint_transform = joint_transform if split == 'train' else transforms.Compose([transforms.Resize((image_size,image_size))])
+        self.split = split
         self.data_folder = data_folder
         self.image_paths = []
         self.mask_paths = []
-
+    
         if data_folder == "DRIVE":
             root_dir = os.path.join(root_path, "DRIVE")
             data_dir = "training"
             images_dir = os.path.join(root_dir, data_dir, "images")
             masks_dir = os.path.join(root_dir, data_dir, "1st_manual")
-
+    
             image_files = sorted(glob.glob(os.path.join(images_dir, "*.tif")))
             mask_files = sorted(glob.glob(os.path.join(masks_dir, "*.gif")))
-
+    
             # Mapping from image IDs to file paths
             image_dict = {}
             for f in image_files:
                 basename = os.path.basename(f)
                 image_id = basename[:2]
                 image_dict[image_id] = f
-
+    
             mask_dict = {}
             for f in mask_files:
                 basename = os.path.basename(f)
                 image_id = basename[:2]
                 mask_dict[image_id] = f
-
-            # Split into train and test sets
+    
+            # Split into train, val, and test sets
             random.seed(628)
-            usefull_idxs = list(range(len(image_dict)))
-            random.shuffle(usefull_idxs)
-            split_idx = int(split_percentage * len(image_dict) / 100)
-            selected_idxs = set(usefull_idxs[:split_idx])
-
+            num_samples = len(image_dict)
+            indices = list(range(num_samples))
+            random.shuffle(indices)
+    
+            train_perc, val_perc, test_perc = split_percentages
+            train_end = int(train_perc * num_samples / 100)
+            val_end = train_end + int(val_perc * num_samples / 100)
+    
+            train_idxs = set(indices[:train_end])
+            val_idxs = set(indices[train_end:val_end])
+            test_idxs = set(indices[val_end:])
+    
             for i, image_id in enumerate(image_dict.keys()):
-                if train and (not i in selected_idxs): continue
-                if (not train) and i in selected_idxs: continue
+                if self.split == 'train' and i not in train_idxs:
+                    continue
+                if self.split == 'val' and i not in val_idxs:
+                    continue
+                if self.split == 'test' and i not in test_idxs:
+                    continue
                 self.image_paths.append(image_dict[image_id])
                 self.mask_paths.append(mask_dict[image_id])
-
+    
         elif data_folder == "PH2_Dataset_images":
             root_dir = os.path.join(root_path, "PH2_Dataset_images")
             all_folders = sorted(glob.glob(os.path.join(root_dir, "IMD*")))
-
-            # Split into train and test sets
+    
+            # Split into train, val, and test sets
             random.seed(628)
-            random.shuffle(all_folders)
-            split_idx = int(split_percentage * len(all_folders) / 100)
-            selected_folders = all_folders[:split_idx] if train else all_folders[split_idx:]
-
-            for folder in selected_folders:
+            num_samples = len(all_folders)
+            indices = list(range(num_samples))
+            random.shuffle(indices)
+    
+            train_perc, val_perc, test_perc = split_percentages
+            train_end = int(train_perc * num_samples / 100)
+            val_end = train_end + int(val_perc * num_samples / 100)
+    
+            train_idxs = set(indices[:train_end])
+            val_idxs = set(indices[train_end:val_end])
+            test_idxs = set(indices[val_end:])
+    
+            for idx in indices:
+                folder = all_folders[idx]
+                if self.split == 'train' and idx not in train_idxs:
+                    continue
+                if self.split == 'val' and idx not in val_idxs:
+                    continue
+                if self.split == 'test' and idx not in test_idxs:
+                    continue
                 imd_id = os.path.basename(folder)
                 image_file = os.path.join(folder, f"{imd_id}_Dermoscopic_Image", f"{imd_id}.bmp")
                 mask_file = os.path.join(folder, f"{imd_id}_lesion", f"{imd_id}_lesion.bmp")
@@ -104,26 +130,25 @@ class CustomDataset(Dataset):
                 self.mask_paths.append(mask_file)
         else:
             raise ValueError(f"Dataset {data_folder} not found.")
-
+    
     def __len__(self):
         return len(self.image_paths)
-
+    
     def __getitem__(self, idx):
         image = Image.open(self.image_paths[idx]).convert("RGB")
         mask = Image.open(self.mask_paths[idx]).convert("L")
-
+    
         # Apply transformations
         if self.image_transform:
             image = self.image_transform(image)
         if self.mask_transform:
             mask = self.mask_transform(mask)
-
+    
         combined = torch.cat([image, mask], dim=0)
         if self.joint_transform:
             combined = self.joint_transform(combined)
         image = combined[:3, :, :]
         mask = combined[3:, :, :]
-
         return image, mask
 
 # Define helper functions
@@ -194,13 +219,15 @@ def get_joint_transforms(config):
 def build_datasets(config):
     joint_transform = get_joint_transforms(config)
 
-    train_dataset = CustomDataset(train=True, image_transform=image_transform, mask_transform=mask_transform, joint_transform=joint_transform, data_folder=config.dataset)
-    test_dataset = CustomDataset(train=False, image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset)
+    train_dataset = CustomDataset(split='train', image_transform=image_transform, mask_transform=mask_transform, joint_transform=joint_transform, data_folder=config.dataset)
+    val_dataset = CustomDataset(split='val', image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset)
+    test_dataset = CustomDataset(split='test', image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=SHUFFLE, num_workers=NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=1, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_dataset, batch_size=1, num_workers=NUM_WORKERS)
 
-    return train_loader, test_loader, train_dataset, test_dataset
+    return train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset
 
 # Define the UNet model with dropout
 class UNet(nn.Module):
@@ -315,7 +342,7 @@ def compute_metrics(preds, targets):
     recall = TP / (TP + FN + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     dice = 2 * TP / (2 * TP + FP + FN + 1e-8)
-    iou = TP / (TP + FP + FN + 1e-8)  # Compute IoU here
+    iou = TP / (TP + FP + FN + 1e-8)
 
     return precision.item(), recall.item(), f1.item(), dice.item(), iou.item()
 
@@ -334,20 +361,22 @@ def save_checkpoint(model, optimizer, epoch, out_dict, path='model_checkpoint.pt
 os.makedirs("checkpoints", exist_ok=True)
 
 # Update the train function
-def train(model, optimizer, train_loader, test_loader, trainset, testset, criterion, num_epochs=10, run_id=""):
+def train(model, optimizer, train_loader, val_loader, trainset, valset, criterion, num_epochs=10, run_id=""):
     out_dict = {
         'train_acc': [],
-        'test_acc': [],
+        'val_acc': [],
         'train_loss': [],
-        'test_loss': [],
+        'val_loss': [],
         'train_precision': [],
-        'test_precision': [],
+        'val_precision': [],
         'train_recall': [],
-        'test_recall': [],
+        'val_recall': [],
         'train_f1': [],
-        'test_f1': [],
+        'val_f1': [],
         'train_dice': [],
-        'test_dice': []
+        'val_dice': [],
+        'train_iou': [],  
+        'val_iou': []     
     }
 
     for epoch in range(num_epochs):
@@ -390,127 +419,108 @@ def train(model, optimizer, train_loader, test_loader, trainset, testset, criter
         train_targets = torch.cat(train_targets)
         train_precision, train_recall, train_f1, train_dice, train_iou = compute_metrics(train_preds, train_targets)
 
-        # Testing phase
-        test_loss = []
-        test_correct = 0
-        test_preds = []
-        test_targets = []
+        # Validation phase
+        val_loss = []
+        val_correct = 0
+        val_preds = []
+        val_targets = []
         model.eval()
 
         with torch.no_grad():
-            for data, target in test_loader:
+            for data, target in val_loader:
                 data, target = data.to(device), target.to(device)
                 output = model(data)
                 loss = criterion(output, target)
 
-                # Track test loss
-                test_loss.append(loss.item())
+                # Track validation loss
+                val_loss.append(loss.item())
 
                 # Predictions and accuracy
                 predicted = (torch.sigmoid(output) >= 0.5).long()
-                test_correct += (target.long() == predicted).sum().cpu().item()
+                val_correct += (target.long() == predicted).sum().cpu().item()
 
                 # Collect predictions and targets
-                test_preds.append(predicted.cpu())
-                test_targets.append(target.long().cpu())
+                val_preds.append(predicted.cpu())
+                val_targets.append(target.long().cpu())
 
-        # Compute metrics on test data
-        test_preds = torch.cat(test_preds)
-        test_targets = torch.cat(test_targets)
-        test_precision, test_recall, test_f1, test_dice, test_iou = compute_metrics(test_preds, test_targets)
+        # Compute metrics on validation data
+        val_preds = torch.cat(val_preds)
+        val_targets = torch.cat(val_targets)
+        val_precision, val_recall, val_f1, val_dice, val_iou = compute_metrics(val_preds, val_targets)
 
         # Record statistics
         out_dict['train_acc'].append(train_correct / (len(trainset) * target.numel()))
-        out_dict['test_acc'].append(test_correct / (len(testset) * target.numel()))
+        out_dict['val_acc'].append(val_correct / (len(valset) * target.numel()))
         out_dict['train_loss'].append(np.mean(train_loss))
-        out_dict['test_loss'].append(np.mean(test_loss))
+        out_dict['val_loss'].append(np.mean(val_loss))
         out_dict['train_precision'].append(train_precision)
-        out_dict['test_precision'].append(test_precision)
+        out_dict['val_precision'].append(val_precision)
         out_dict['train_recall'].append(train_recall)
-        out_dict['test_recall'].append(test_recall)
+        out_dict['val_recall'].append(val_recall)
         out_dict['train_f1'].append(train_f1)
-        out_dict['test_f1'].append(test_f1)
+        out_dict['val_f1'].append(val_f1)
         out_dict['train_dice'].append(train_dice)
-        out_dict['test_dice'].append(test_dice)
-        out_dict['train_iou'].append(train_iou)
-        out_dict['test_iou'].append(test_iou)
+        out_dict['val_dice'].append(val_dice)
+        out_dict['train_iou'].append(train_iou)  
+        out_dict['val_iou'].append(val_iou)      
 
-        # Log to WandB
+        # Log to WandB (validation metrics only)
         wandb.log({
-            "train_acc": out_dict['train_acc'][-1],
-            "test_acc": out_dict['test_acc'][-1],
-            "train_loss": out_dict['train_loss'][-1],
-            "test_loss": out_dict['test_loss'][-1],
-            "train_precision": out_dict['train_precision'][-1],
-            "test_precision": out_dict['test_precision'][-1],
-            "train_recall": out_dict['train_recall'][-1],
-            "test_recall": out_dict['test_recall'][-1],
-            "train_f1": out_dict['train_f1'][-1],
-            "test_f1": out_dict['test_f1'][-1],
-            "train_dice": out_dict['train_dice'][-1],
-            "test_dice": out_dict['test_dice'][-1],
-            "train_iou": out_dict['train_iou'][-1],
-            "test_iou": out_dict['test_iou'][-1],
+            "val_acc": out_dict['val_acc'][-1],
+            "val_loss": out_dict['val_loss'][-1],
+            "val_precision": out_dict['val_precision'][-1],
+            "val_recall": out_dict['val_recall'][-1],
+            "val_f1": out_dict['val_f1'][-1],
+            "val_dice": out_dict['val_dice'][-1],
+            "val_iou": out_dict['val_iou'][-1],
             "epoch": epoch,
             "run_id": run_id
         })
 
-        # # Saves the model
-        # save_path = f"./checkpoints/epoch_{epoch}_{run_id}.pth"
-        # save_checkpoint(model, optimizer, epoch, out_dict, save_path)
-
         # Print progress
         print(f"Epoch {epoch+1}/{num_epochs}: "
               f"Train Loss: {out_dict['train_loss'][-1]:.3f}, "
-              f"Test Loss: {out_dict['test_loss'][-1]:.3f}, "
+              f"Val Loss: {out_dict['val_loss'][-1]:.3f}, "
               f"Train Acc: {out_dict['train_acc'][-1]*100:.2f}%, "
-              f"Test Acc: {out_dict['test_acc'][-1]*100:.2f}%, "
+              f"Val Acc: {out_dict['val_acc'][-1]*100:.2f}%, "
               f"Train Dice: {out_dict['train_dice'][-1]:.3f}, "
-              f"Test Dice: {out_dict['test_dice'][-1]:.3f}")
+              f"Val Dice: {out_dict['val_dice'][-1]:.3f}")
 
     return out_dict
 
 # Update the sweep configuration for the DRIVE dataset
 sweep_config_drive = {
     'method': 'grid',
-    'metric': {'name': 'test_loss', 'goal': 'minimize'},
+    'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
         'learning_rate': {'values': [1e-4, 1e-3, 1e-2]},
-        'batch_size': {'values': [1, 2, 4]},
+        'batch_size': {'values': 4},
         'num_layers': {'values': [3, 4, 5, 6]},
         'base_channels': {'values': [8, 16, 32]},
         'dropout': {'values': [0.0, 0.2, 0.5]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
-        'dataset': {'value': 'DRIVE'},  # Fixed dataset
+        'dataset': {'value': 'DRIVE'}, 
         'epochs': {'value': 400},
-        'image_size': {'value': 128}
+        'image_size': {'value': [64, 128, 256]}
     }
 }
-
-# Initialize the sweep for the DRIVE dataset
-sweep_id_drive = wandb.sweep(sweep_config_drive, project='SegmentationProject_DRIVE')
 
 # Update the sweep configuration for the PH2 dataset
 sweep_config_ph2 = {
     'method': 'grid',
-    'metric': {'name': 'test_loss', 'goal': 'minimize'},
+    'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
         'learning_rate': {'values': [1e-4, 1e-3, 1e-2]},
-        'batch_size': {'values': [1, 2, 4]},
+        'batch_size': {'values': 4},
         'num_layers': {'values': [3, 4, 5, 6]},
         'base_channels': {'values': [8, 16, 32]},
         'dropout': {'values': [0.0, 0.2, 0.5]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
-        'dataset': {'value': 'PH2_Dataset_images'},  # Fixed dataset
+        'dataset': {'value': 'PH2_Dataset_images'}, 
         'epochs': {'value': 400},
-        'image_size': {'value': 128}
+        'image_size': {'value': [64, 128, 256]}
     }
 }
-
-# Initialize the sweep for the DRIVE dataset
-sweep_id_drive = wandb.sweep(sweep_config_drive, project='SegmentationProject_DRIVE')
-# Initialize the sweep for the PH2 dataset
-sweep_id_ph2 = wandb.sweep(sweep_config_ph2, project='SegmentationProject_PH2')
 
 # Update the run_wandb function
 def run_wandb(config=None):
@@ -523,7 +533,7 @@ def run_wandb(config=None):
         wandb.run.name = f"Run {run_id}"
 
         # Build datasets and dataloaders
-        train_loader, test_loader, train_dataset, test_dataset = build_datasets(config)
+        train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = build_datasets(config)
 
         # Build model
         model = UNet(num_layers=config.num_layers, base_channels=config.base_channels, dropout=config.dropout).to(device)
@@ -535,7 +545,7 @@ def run_wandb(config=None):
         criterion = lossmap[config.loss_function]
 
         # Run training
-        out_dict = train(model, optimizer, train_loader, test_loader, train_dataset, test_dataset, criterion, num_epochs=config.epochs, run_id=run_id)
+        out_dict = train(model, optimizer, train_loader, val_loader, train_dataset, val_dataset, criterion, num_epochs=config.epochs, run_id=run_id)
 
         # Save the model
         os.makedirs("./models", exist_ok=True)
@@ -543,7 +553,14 @@ def run_wandb(config=None):
         torch.save(model.state_dict(), model_path)
         wandb.save(model_path)
 
-# Run the sweep
+
+# # Initialize the sweep for the DRIVE dataset
+sweep_id_drive = wandb.sweep(sweep_config_drive, project='SegmentationProject_DRIVE')
+# Initialize the sweep for the PH2 dataset
+# sweep_id_ph2 = wandb.sweep(sweep_config_ph2, project='SegmentationProject_PH2')
+
+# Run the sweeps
 wandb.agent(sweep_id_drive, run_wandb)
-wandb.agent(sweep_id_ph2, run_wandb)
+# wandb.agent(sweep_id_ph2, run_wandb)
+
 
