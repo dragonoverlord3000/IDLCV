@@ -278,9 +278,9 @@ def get_joint_transforms(config):
 def build_datasets(config):
     joint_transform = get_joint_transforms(config)
 
-    train_dataset = CustomDataset(split='train', image_transform=image_transform, mask_transform=mask_transform, joint_transform=joint_transform, data_folder=config.dataset)
-    val_dataset = CustomDataset(split='val', image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset)
-    test_dataset = CustomDataset(split='test', image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset)
+    train_dataset = CustomDataset(split='train', image_transform=image_transform, mask_transform=mask_transform, joint_transform=joint_transform, data_folder=config.dataset, image_size=config.image_size)
+    val_dataset = CustomDataset(split='val', image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset, image_size=config.image_size)
+    test_dataset = CustomDataset(split='test', image_transform=image_transform, mask_transform=mask_transform, data_folder=config.dataset, image_size=config.image_size)
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=SHUFFLE, num_workers=NUM_WORKERS)
     val_loader = DataLoader(val_dataset, batch_size=1, num_workers=NUM_WORKERS)
@@ -308,6 +308,9 @@ class UNet(nn.Module):
             out_channels = base_channels * 2**(i+1)
             block = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 3, padding=1, stride=2, padding_mode="reflect"),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1, padding_mode="reflect"),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout)
             )
@@ -337,6 +340,9 @@ class UNet(nn.Module):
             block = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 3, padding=1, padding_mode="reflect"),
                 nn.Identity() if i == num_layers - 1 else nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1, padding_mode="reflect"),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout)
             )
@@ -406,6 +412,34 @@ def focal_loss(y_pred, y_real):
 def mixed_loss(y_pred, y_real):
     return bce_loss(y_pred, y_real) + dice_loss(y_pred, y_real)
 
+def calculate_class_weights(dataset):
+    total_pixels = 0
+    foreground_pixels = 0
+    background_pixels = 0
+
+    for _, mask in tqdm(dataset, desc="Calculating class weights"):
+        mask = mask > 0.5  # Assume mask is binary (foreground = 1, background = 0)
+        foreground_pixels += mask.sum().item()
+        background_pixels += mask.numel() - mask.sum().item()
+        total_pixels += mask.numel()
+
+    # Calculate weights: higher weight to the less frequent class
+    weight_foreground = total_pixels / (2 * foreground_pixels)
+    weight_background = total_pixels / (2 * background_pixels)
+    return weight_foreground, weight_background
+
+# Function to set criterion based on dataset type
+def get_weighted_bce_loss(train_loader, dataset_name):
+    weight_foreground, weight_background = calculate_class_weights(train_loader.dataset)
+    
+    def weighted_bce_loss(y_pred, y_real):
+        # Assign weights based on the foreground and background classes
+        weight_map = torch.where(y_real > 0.5, weight_foreground, weight_background)
+        loss = F.binary_cross_entropy_with_logits(y_pred, y_real, weight=weight_map)
+        return loss
+
+    return weighted_bce_loss
+
 # For WandB purposes
 lossmap = {"bce": bce_loss, "dice": dice_loss, "mixed": mixed_loss, "focal": focal_loss}
 
@@ -463,20 +497,26 @@ def save_checkpoint(model, optimizer, epoch, out_dict, path='model_checkpoint.pt
 os.makedirs("checkpoints", exist_ok=True)
 
 # Update the train function
-def train(model, optimizer, train_loader, val_loader, criterion, num_epochs=10, run_id=""):
+def train(model, optimizer, train_loader, val_loader, test_loader, criterion, num_epochs=10, run_id=""):
     out_dict = {
         'train_dice': [],
         'val_dice': [],
+        "test_dice": [],
         'train_iou': [],
         'val_iou': [],
+        "test_iou": [],
         'train_acc': [],
         'val_acc': [],
+        "test_acc": [],
         'train_sensitivity': [],
         'val_sensitivity': [],
+        "test_sensitivity": [],
         'train_specificity': [],
         'val_specificity': [],
+        "test_specificity": [],
         'train_loss': [],
-        'val_loss': []
+        'val_loss': [],
+        "test_loss": []
     }
 
     for epoch in range(num_epochs):
@@ -520,19 +560,46 @@ def train(model, optimizer, train_loader, val_loader, criterion, num_epochs=10, 
         # Compute validation metrics
         val_dice, val_iou, val_acc, val_sensitivity, val_specificity = compute_metrics(val_preds, val_targets)
 
+        # Test phase
+        test_preds = []
+        test_targets = []
+        model.eval()
+
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+
+                test_preds.append(torch.sigmoid(output).cpu())
+                test_targets.append(target.long().cpu())
+
+        # Compute validation metrics
+        test_dice, test_iou, test_acc, test_sensitivity, test_specificity = compute_metrics(test_preds, test_targets)
+
         # Record metrics
         out_dict['train_loss'].append(np.mean(train_loss))
         out_dict['val_loss'].append(np.mean(val_loss))
+
         out_dict['train_dice'].append(train_dice)
         out_dict['val_dice'].append(val_dice)
+        out_dict['test_dice'].append(test_dice)
+
         out_dict['train_iou'].append(train_iou)
         out_dict['val_iou'].append(val_iou)
+        out_dict['test_iou'].append(test_iou)
+
         out_dict['train_acc'].append(train_acc)
         out_dict['val_acc'].append(val_acc)
+        out_dict['test_acc'].append(test_acc)
+
         out_dict['train_sensitivity'].append(train_sensitivity)
         out_dict['val_sensitivity'].append(val_sensitivity)
+        out_dict['test_sensitivity'].append(test_sensitivity)
+
         out_dict['train_specificity'].append(train_specificity)
         out_dict['val_specificity'].append(val_specificity)
+        out_dict['test_specificity'].append(test_specificity)
+
 
         # Log to WandB
         wandb.log({
@@ -546,6 +613,11 @@ def train(model, optimizer, train_loader, val_loader, criterion, num_epochs=10, 
             "train_acc": train_acc,
             "train_sensitivity": train_sensitivity,
             "train_specificity": train_specificity,
+            "test_dice": test_dice,
+            "test_iou": test_iou,
+            "test_acc": test_acc,
+            "test_sensitivity": test_sensitivity,
+            "test_specificity": test_specificity,
             "epoch": epoch,
             "run_id": run_id
         })
@@ -555,44 +627,62 @@ def train(model, optimizer, train_loader, val_loader, criterion, num_epochs=10, 
               f"Val Loss: {out_dict['val_loss'][-1]:.3f}, "
               f"Train Acc: {train_acc*100:.2f}%, "
               f"Val Acc: {val_acc*100:.2f}%, "
+              f"Test Acc: {test_acc*100:.2f}%, "
               f"Train Dice: {train_dice:.3f}, "
               f"Val Dice: {val_dice:.3f}, "
+              f"Test Dice: {test_dice:.3f}, "
               f"Train IoU: {train_iou:.3f}, "
-              f"Val IoU: {val_iou:.3f}")
+              f"Val IoU: {val_iou:.3f}, "
+              f"Test IoU: {test_iou:.3f}")
 
     # Final validation visualization
     visualizer_train(val_loader.dataset, model, num_samples=2, title="Final_Validation_Visualization", run_id=run_id)
+    save_checkpoint(model, optimizer, num_epochs, out_dict, f"./models/{run_id}.pth")
     return out_dict
 
 # Update the sweep configuration for the DRIVE dataset
 sweep_config_drive = {
-    'method': 'grid',
+    'method': 'bayes',
     'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
         'learning_rate': {'values': [1e-3, 1e-4]},
         'batch_size': {'value': 4},
         'num_layers': {'values': [3, 4, 5, 6]},
         'base_channels': {'value': 16},
+        "epochs": {"value": 200},
         "dropout": {"values": [0.0, 0.2]},
-        'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal', "weighted"]},
+        'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal', "weighted_drive"]},
         'dataset': {'value': 'DRIVE'}, 
-        'image_size': {"value": 128}
+        'image_size': {"values": [128, 256]}
+    },
+    'early_terminate': {
+        'type': 'hyperband',
+        's': 2,
+        'eta': 3,
+        'max_iter': 200
     }
 }
 
 # Update the sweep configuration for the PH2 dataset
 sweep_config_ph2 = {
-    'method': 'grid',
+    'method': 'bayes',
     'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
         'learning_rate': {'values': [1e-3, 1e-4]},
         'batch_size': {'value': 4},
         'num_layers': {'values': [3, 4, 5, 6]},
         'base_channels': {'value': 16},
+        "epochs": {"value": 40},
         "dropout": {"values": [0.0, 0.2]},
-        'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal', "weighted"]},
+        'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal', "weighted_ph2"]},
         'dataset': {'value': 'PH2_Dataset_images'}, 
-        'image_size': {'value': 128}
+        'image_size': {'values': [128, 256]}
+    },
+    'early_terminate': {
+        'type': 'hyperband',
+        's': 2,
+        'eta': 3,
+        'max_iter': 40
     }
 }
 
@@ -617,10 +707,16 @@ def run_wandb(config=None):
         optimizer = build_optimizer(model, "adam", config.learning_rate)
 
         # Choose loss function
-        criterion = lossmap[config.loss_function]
-
+        criterion = None
+        if config.loss_function in lossmap:
+            criterion = lossmap[config.loss_function]
+        elif config.loss_function == "weighted_drive":
+            criterion = get_weighted_bce_loss(train_loader, "DRIVE")
+        elif config.loss_function == "weighted_ph2":
+            criterion = get_weighted_bce_loss(train_loader, "PH2")
+            
         # Run training
-        out_dict = train(model, optimizer, train_loader, val_loader, criterion, num_epochs=EPOCHS, run_id=run_id)
+        out_dict = train(model, optimizer, train_loader, val_loader, test_loader, criterion, num_epochs=config.epochs, run_id=run_id)
 
         # Save the model
         os.makedirs("./models", exist_ok=True)
