@@ -37,13 +37,20 @@ NUM_WORKERS = 1
 NUM_LAYERS = 6
 SHUFFLE = True
 
+flag_drive_val = True
+flag_ph2_val = True
+flag_drive_test = True
+flag_ph2_test = True
+
 # Define the CustomDataset class
 class CustomDataset(Dataset):
     def __init__(self, split='train', image_transform=None, mask_transform=None, joint_transform=None, data_folder="DRIVE", split_percentages=(68,16,16), image_size=128):
-        self.image_transform = image_transform if "train" else transforms.Compose([transforms.RandomCrop((image_size,image_size))])
+        global flag_drive_val, flag_ph2_val, flag_drive_test, flag_ph2_test
+        
+        self.image_transform = image_transform if "train" else transforms.Compose([transforms.Normalize(mean=mean, std=std)])
         self.mask_transform = mask_transform
         if data_folder == "DRIVE":
-            self.joint_transform = joint_transform if split == 'train' else transforms.Compose([transforms.CenterCrop((image_size,image_size))])
+            self.joint_transform = joint_transform if split == 'train' else transforms.Compose([transforms.RandomCrop((image_size,image_size))])
         else:
             self.joint_transform = joint_transform if split == 'train' else transforms.Compose([transforms.Resize((image_size,image_size))])
         self.split = split
@@ -97,6 +104,13 @@ class CustomDataset(Dataset):
                 self.image_paths.append(image_dict[image_id])
                 self.mask_paths.append(mask_dict[image_id])
     
+            if flag_drive_val and split == "val":
+                print("Drive val ", self.image_paths)
+                flag_drive_val = False
+            if flag_drive_test and split == "test":
+                print("Drive test ", self.image_paths)
+                flag_drive_test = False
+
         elif data_folder == "PH2_Dataset_images":
             root_dir = os.path.join(root_path, "PH2_Dataset_images")
             all_folders = sorted(glob.glob(os.path.join(root_dir, "IMD*")))
@@ -128,6 +142,14 @@ class CustomDataset(Dataset):
                 mask_file = os.path.join(folder, f"{imd_id}_lesion", f"{imd_id}_lesion.bmp")
                 self.image_paths.append(image_file)
                 self.mask_paths.append(mask_file)
+
+            if flag_ph2_val and split == "val":
+                print("PH2 val ", self.image_paths)
+                flag_ph2_val = False
+            if flag_ph2_test and split == "test":
+                print("PH2 test ", self.image_paths)
+                flag_ph2_test = False
+
         else:
             raise ValueError(f"Dataset {data_folder} not found.")
     
@@ -189,7 +211,7 @@ def get_stats(dataset):
 # Initialize datasets
 image_transform = transforms.Compose([
     transforms.ToTensor(),
-    transforms.ColorJitter(),
+    # transforms.ColorJitter(),
     transforms.Normalize(mean=mean, std=std),
 ])
 
@@ -229,11 +251,11 @@ def build_datasets(config):
 
     return train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset
 
-# Define the UNet model with dropout
 class UNet(nn.Module):
     def __init__(self, num_layers=4, base_channels=32, dropout=0.0):
         super().__init__()
         self.dropout = dropout
+        self.num_layers = num_layers
 
         # Input convolution
         self.inp = nn.Sequential(
@@ -243,54 +265,75 @@ class UNet(nn.Module):
         )
 
         # Encoder (downsampling)
-        self.encoder_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(base_channels * 2**i, base_channels * 2**(i+1), 3, padding=1, stride=2, padding_mode="reflect"),
+        self.encoder_blocks = nn.ModuleList()
+        for i in range(num_layers):
+            in_channels = base_channels * 2**i
+            out_channels = base_channels * 2**(i+1)
+            block = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1, stride=2, padding_mode="reflect"),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout)
             )
-            for i in range(num_layers)
-        ])
+            self.encoder_blocks.append(block)
 
         # Bottleneck
+        bottleneck_channels = base_channels * 2**num_layers
         self.bottleneck_conv = nn.Sequential(
-            nn.Conv2d(base_channels * 2**num_layers, base_channels * 2**num_layers, 3, padding=1, padding_mode="reflect"),
+            nn.Conv2d(bottleneck_channels, bottleneck_channels, 3, padding=1, padding_mode="reflect"),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout)
         )
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
         # Decoder (upsampling)
-        self.decoder_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                nn.Conv2d(base_channels * 2**(num_layers - i) * 2, base_channels * 2**(num_layers - i - 1), 3, padding=1, padding_mode="reflect"),
+        self.decoder_blocks = nn.ModuleList()
+        for i in range(num_layers):
+            if i == 0:
+                in_channels = bottleneck_channels + base_channels * 2**(num_layers - 1)
+                out_channels = base_channels * 2**(num_layers - 1)
+            elif i < num_layers - 1:
+                in_channels = base_channels * 2**(num_layers - i) + base_channels * 2**(num_layers - i - 1)
+                out_channels = base_channels * 2**(num_layers - i - 1)
+            else:  # Last decoder block
+                in_channels = base_channels * 2 + base_channels + 3  # x channels + encoder_outs[0] + x_input
+                out_channels = base_channels
+            block = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1, padding_mode="reflect"),
+                nn.Identity() if i == num_layers - 1 else nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout)
             )
-            for i in range(num_layers)
-        ])
+            self.decoder_blocks.append(block)
 
         # Output convolution
         self.out = nn.Conv2d(base_channels, 1, 3, padding=1, padding_mode="reflect")
 
     def forward(self, x):
-        # Input
+        x_input = x  # Store the input for skip connection
+
+        # Input convolution
         x = self.inp(x)
+        encoder_outs = [x]
 
         # Encoder
-        encoder_outs = []
         for encoder_block in self.encoder_blocks:
             x = encoder_block(x)
             encoder_outs.append(x)
 
         # Bottleneck
         x = self.bottleneck_conv(encoder_outs[-1])
+        x = self.up(x)  # Upsample bottleneck output
 
         # Decoder
         for i, decoder_block in enumerate(self.decoder_blocks):
-            x = decoder_block(torch.cat([x, encoder_outs[-1 - i]], dim=1))
+            if i < self.num_layers - 1:
+                # Concatenate with corresponding encoder output
+                x = decoder_block(torch.cat([x, encoder_outs[-(i+2)]], dim=1))
+            else:
+                # Last decoder block: concatenate with initial encoder output and input
+                x = decoder_block(torch.cat([x, encoder_outs[0], x_input], dim=1))
 
-        # Output
+        # Output convolution
         out = self.out(x)
         return out
 
@@ -375,8 +418,8 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
         'val_f1': [],
         'train_dice': [],
         'val_dice': [],
-        'train_iou': [],  
-        'val_iou': []     
+        'train_iou': [],
+        'val_iou': []
     }
 
     for epoch in range(num_epochs):
@@ -385,6 +428,7 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
         train_loss = []
         train_preds = []
         train_targets = []
+        total_pixels = 0  # Initialize total pixels
 
         # Training phase
         for minibatch_no, (data, target) in enumerate(train_loader):
@@ -408,11 +452,17 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
 
             # Predictions and accuracy
             predicted = (torch.sigmoid(output) >= 0.5).long()
-            train_correct += (target.long() == predicted).sum().cpu().item()
+            train_correct += (target == predicted).sum().cpu().item()
+
+            # Update total pixels
+            total_pixels += target.numel()
 
             # Collect predictions and targets
             train_preds.append(predicted.cpu())
             train_targets.append(target.long().cpu())
+
+        # Compute training accuracy
+        train_accuracy = train_correct / total_pixels
 
         # Compute metrics on training data
         train_preds = torch.cat(train_preds)
@@ -424,24 +474,33 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
         val_correct = 0
         val_preds = []
         val_targets = []
+        total_pixels_val = 0  # Initialize total pixels for validation
         model.eval()
 
-        with torch.no_grad():
-            for data, target in val_loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                loss = criterion(output, target)
+        # Due to small amount of data + random cropping
+        for _ in range(10):
+            with torch.no_grad():
+                for data, target in val_loader:
+                    data, target = data.to(device), target.to(device)
+                    output = model(data)
+                    loss = criterion(output, target)
 
-                # Track validation loss
-                val_loss.append(loss.item())
+                    # Track validation loss
+                    val_loss.append(loss.item())
 
-                # Predictions and accuracy
-                predicted = (torch.sigmoid(output) >= 0.5).long()
-                val_correct += (target.long() == predicted).sum().cpu().item()
+                    # Predictions and accuracy
+                    predicted = (torch.sigmoid(output) >= 0.5).long()
+                    val_correct += (target == predicted).sum().cpu().item()
 
-                # Collect predictions and targets
-                val_preds.append(predicted.cpu())
-                val_targets.append(target.long().cpu())
+                    # Update total pixels for validation
+                    total_pixels_val += target.numel()
+
+                    # Collect predictions and targets
+                    val_preds.append(predicted.cpu())
+                    val_targets.append(target.long().cpu())
+
+        # Compute validation accuracy
+        val_accuracy = val_correct / total_pixels_val
 
         # Compute metrics on validation data
         val_preds = torch.cat(val_preds)
@@ -449,8 +508,8 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
         val_precision, val_recall, val_f1, val_dice, val_iou = compute_metrics(val_preds, val_targets)
 
         # Record statistics
-        out_dict['train_acc'].append(train_correct / (len(trainset) * target.numel()))
-        out_dict['val_acc'].append(val_correct / (len(valset) * target.numel()))
+        out_dict['train_acc'].append(train_accuracy)
+        out_dict['val_acc'].append(val_accuracy)
         out_dict['train_loss'].append(np.mean(train_loss))
         out_dict['val_loss'].append(np.mean(val_loss))
         out_dict['train_precision'].append(train_precision)
@@ -461,18 +520,18 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
         out_dict['val_f1'].append(val_f1)
         out_dict['train_dice'].append(train_dice)
         out_dict['val_dice'].append(val_dice)
-        out_dict['train_iou'].append(train_iou)  
-        out_dict['val_iou'].append(val_iou)      
+        out_dict['train_iou'].append(train_iou)
+        out_dict['val_iou'].append(val_iou)
 
         # Log to WandB (validation metrics only)
         wandb.log({
-            "val_acc": out_dict['val_acc'][-1],
+            "val_acc": val_accuracy,
             "val_loss": out_dict['val_loss'][-1],
-            "val_precision": out_dict['val_precision'][-1],
-            "val_recall": out_dict['val_recall'][-1],
-            "val_f1": out_dict['val_f1'][-1],
-            "val_dice": out_dict['val_dice'][-1],
-            "val_iou": out_dict['val_iou'][-1],
+            "val_precision": val_precision,
+            "val_recall": val_recall,
+            "val_f1": val_f1,
+            "val_dice": val_dice,
+            "val_iou": val_iou,
             "epoch": epoch,
             "run_id": run_id
         })
@@ -481,27 +540,30 @@ def train(model, optimizer, train_loader, val_loader, trainset, valset, criterio
         print(f"Epoch {epoch+1}/{num_epochs}: "
               f"Train Loss: {out_dict['train_loss'][-1]:.3f}, "
               f"Val Loss: {out_dict['val_loss'][-1]:.3f}, "
-              f"Train Acc: {out_dict['train_acc'][-1]*100:.2f}%, "
-              f"Val Acc: {out_dict['val_acc'][-1]*100:.2f}%, "
-              f"Train Dice: {out_dict['train_dice'][-1]:.3f}, "
-              f"Val Dice: {out_dict['val_dice'][-1]:.3f}")
+              f"Train Acc: {train_accuracy*100:.2f}%, "
+              f"Val Acc: {val_accuracy*100:.2f}%, "
+              f"Train Dice: {train_dice:.3f}, "
+              f"Val Dice: {val_dice:.3f}, "
+              f"Train IoU: {train_iou:.3f}, "
+              f"Val IoU: {val_iou:.3f}")
 
     return out_dict
+
 
 # Update the sweep configuration for the DRIVE dataset
 sweep_config_drive = {
     'method': 'grid',
     'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
-        'learning_rate': {'values': [1e-4, 1e-3, 1e-2]},
-        'batch_size': {'values': 4},
+        'learning_rate': {'values': [1e-4, 1e-3]},
+        'batch_size': {'value': 4},
         'num_layers': {'values': [3, 4, 5, 6]},
-        'base_channels': {'values': [8, 16, 32]},
-        'dropout': {'values': [0.0, 0.2, 0.5]},
+        'base_channels': {'values': [8, 16]},
+        'dropout': {'values': [0.0, 0.2]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
         'dataset': {'value': 'DRIVE'}, 
-        'epochs': {'value': 400},
-        'image_size': {'value': [64, 128, 256]}
+        'epochs': {'value': 200},
+        'image_size': {'values': [64, 128]}
     }
 }
 
@@ -510,15 +572,15 @@ sweep_config_ph2 = {
     'method': 'grid',
     'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
-        'learning_rate': {'values': [1e-4, 1e-3, 1e-2]},
-        'batch_size': {'values': 4},
+        'learning_rate': {'values': [1e-4, 1e-3]},
+        'batch_size': {'value': 4},
         'num_layers': {'values': [3, 4, 5, 6]},
-        'base_channels': {'values': [8, 16, 32]},
-        'dropout': {'values': [0.0, 0.2, 0.5]},
+        'base_channels': {'values': [8, 16]},
+        'dropout': {'values': [0.0, 0.2]},
         'loss_function': {'values': ['bce', 'dice', 'mixed', 'focal']},
         'dataset': {'value': 'PH2_Dataset_images'}, 
-        'epochs': {'value': 400},
-        'image_size': {'value': [64, 128, 256]}
+        'epochs': {'value': 200},
+        'image_size': {'values': [64, 128]}
     }
 }
 
@@ -537,6 +599,7 @@ def run_wandb(config=None):
 
         # Build model
         model = UNet(num_layers=config.num_layers, base_channels=config.base_channels, dropout=config.dropout).to(device)
+        print(model)
 
         # Build optimizer
         optimizer = build_optimizer(model, "adam", config.learning_rate)
